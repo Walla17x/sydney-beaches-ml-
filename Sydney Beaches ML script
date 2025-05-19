@@ -1,0 +1,266 @@
+# ===================================================================
+# Sydney Beaches Water Quality ML Project — TidyTuesday 2025-05-20
+# Advanced Regression, Classification, and SMOTE Balancing Example
+# ===================================================================
+# Author: Travis Walla | LinkedIn: linkedin.com/in/traviswalla
+# Project: ML-Driven Water Quality Risk Assessment for Sydney Beaches
+# -------------------------------------------------------------------
+
+# 0. Package Setup ---------------------------------------------------
+required <- c("tidyverse", "lubridate", "sf", "leaflet", "ranger",
+              "yardstick", "vip", "slider", "pROC", "PRROC", "recipes", "themis")
+to_install <- setdiff(required, installed.packages()[,"Package"])
+if(length(to_install)) install.packages(to_install)
+lapply(required, library, character.only = TRUE)
+
+# 1. Data Load & Preprocessing ---------------------------------------
+# Source: TidyTuesday 2025-05-20
+url_base <- "https://raw.githubusercontent.com/rfordatascience/tidytuesday/main/data/2025/2025-05-20"
+wq <- read_csv(file.path(url_base,"water_quality.csv"))   # Water quality data
+wx <- read_csv(file.path(url_base,"weather.csv"))         # Daily weather data
+
+# Join by date for precipitation, and order records by site/date for feature engineering
+df <- wq %>%
+  left_join(wx %>% select(date, precipitation_mm), by = "date") %>%
+  arrange(swim_site, date)
+
+# 2. Feature Engineering ---------------------------------------------
+df_feats <- df %>%
+  group_by(swim_site) %>% arrange(date) %>%
+  mutate(
+    # Lag/rolling features for precipitation & water metrics
+    lag1_precip  = lag(precipitation_mm, 1),
+    roll3_precip = slider::slide_dbl(precipitation_mm, sum, .before=2, .complete=TRUE),
+    roll7_precip = slider::slide_dbl(precipitation_mm, sum, .before=6, .complete=TRUE),
+    lag1_temp    = lag(water_temperature_c, 1),
+    lag1_cond    = lag(conductivity_ms_cm, 1),
+    dow          = wday(date, label=TRUE),
+    month        = month(date, label=TRUE),
+    season       = case_when(
+      month(date) %in% c(12,1,2) ~ "Summer",
+      month(date) %in% c(3,4,5)  ~ "Autumn",
+      month(date) %in% c(6,7,8)  ~ "Winter",
+      TRUE                       ~ "Spring"
+    ),
+    exceed       = enterococci_cfu_100ml > 200   # Regulatory threshold flag (binary)
+  ) %>%
+  ungroup() %>%
+  drop_na(lag1_precip, roll3_precip, roll7_precip, lag1_temp, lag1_cond, enterococci_cfu_100ml) %>%
+  mutate(
+    swim_site = factor(swim_site),
+    season    = factor(season, levels = c("Summer","Autumn","Winter","Spring"))
+  )
+cat("Rows after cleaning and feature engineering:", nrow(df_feats), "\n")
+
+# 3. Exploratory Data Analysis (EDA) ---------------------------------
+ggplot(df_feats, aes(enterococci_cfu_100ml)) + 
+  geom_histogram(bins=100) + 
+  scale_x_log10() +
+  labs(title="Histogram of Enterococci (log10 scale)", x="Enterococci CFU/100mL (log10)")
+
+cat("Exceedance rate (over regulatory limit):", mean(df_feats$exceed), "\n")
+
+# 4. Time-based Train/Test Split -------------------------------------
+# 80% training, 20% test (time-ordered)
+n          <- nrow(df_feats)
+train_size <- floor(0.8 * n)
+train      <- df_feats[1:train_size, ]
+test       <- df_feats[(train_size+1):n, ]
+cat("Train rows:", nrow(train), "Test rows:", nrow(test), "\n")
+
+# Ensure factors have identical levels in both sets
+for (v in c("dow", "month", "season", "swim_site")) {
+  train[[v]] <- factor(train[[v]], levels=levels(df_feats[[v]]))
+  test[[v]]  <- factor(test[[v]],  levels=levels(df_feats[[v]]))
+}
+
+# 5. Random Forest Regression ----------------------------------------
+set.seed(42)
+rf_reg <- ranger(
+  enterococci_cfu_100ml ~ swim_site + lag1_precip + roll3_precip + roll7_precip +
+    lag1_temp + lag1_cond + dow + month + season,
+  data       = train,
+  importance = "permutation",
+  num.trees  = 500
+)
+# Evaluate on test set
+preds_reg <- predict(rf_reg, data = test, type="response")$predictions
+rmse_val <- yardstick::rmse_vec(test$enterococci_cfu_100ml, preds_reg)
+rsq_val  <- yardstick::rsq_vec(test$enterococci_cfu_100ml, preds_reg)
+cat("Regression RMSE:", round(rmse_val,2), "CFU/100mL | R²:", round(rsq_val,3), "\n")
+
+# Visualize actual vs predicted
+df_plot <- tibble(actual=test$enterococci_cfu_100ml, predicted=preds_reg)
+ggplot(df_plot, aes(actual, predicted)) +
+  geom_point(alpha=0.2) +
+  geom_abline(slope=1, intercept=0, color="red") +
+  scale_x_log10() + scale_y_log10() +
+  labs(title="Regression: Actual vs Predicted Enterococci (log10)", x="Actual", y="Predicted")
+
+# Explainability: Which features drive the model?
+vip(rf_reg, num_features = 12) + labs(title="Permutation Importance: Random Forest Regression")
+
+# 6. Random Forest Classification (Exceedance) -----------------------
+set.seed(42)
+rf_clf <- ranger(
+  exceed ~ swim_site + lag1_precip + roll3_precip + roll7_precip +
+    lag1_temp + lag1_cond + dow + month + season,
+  data       = train,
+  importance = "permutation",
+  num.trees  = 500,
+  probability = TRUE
+)
+# Predict exceedance probability
+pred_raw <- predict(rf_clf, data = test, type = "response")$predictions
+if (is.matrix(pred_raw) && "TRUE" %in% colnames(pred_raw)) {
+  preds_clf <- pred_raw[, "TRUE"]
+} else if (is.matrix(pred_raw)) {
+  preds_clf <- pred_raw[, 1]
+} else if (is.vector(pred_raw)) {
+  preds_clf <- as.numeric(pred_raw)
+} else {
+  stop("Unknown prediction output type")
+}
+
+predicted_class <- preds_clf > 0.5
+accuracy <- mean(predicted_class == test$exceed)
+roc_obj <- tryCatch({ pROC::roc(response = test$exceed, predictor = preds_clf) }, error = function(e) NA)
+auc_val <- if (inherits(roc_obj, "roc")) as.numeric(pROC::auc(roc_obj)) else NA
+cat("Classification Accuracy:", round(accuracy,3), "ROC AUC:", round(auc_val,3), "\n")
+print(table(Predicted=predicted_class, Actual=test$exceed))
+
+# Visualize predicted probability vs actual outcome
+df_plot2 <- tibble(actual=as.numeric(test$exceed), predicted_prob=preds_clf)
+ggplot(df_plot2, aes(x=predicted_prob, fill=factor(actual))) +
+  geom_histogram(bins=40, position="identity", alpha=0.4) +
+  labs(title="Predicted Exceedance Probability by Actual", fill="Actual Exceed")
+
+# Explainability for classification
+vip(rf_clf, num_features = 12) + labs(title="Permutation Importance: Random Forest Classification")
+
+# Precision-Recall and threshold tuning
+pr <- PRROC::pr.curve(scores.class0 = preds_clf[test$exceed == TRUE],
+                      scores.class1 = preds_clf[test$exceed == FALSE],
+                      curve = TRUE)
+plot(pr, main = "Precision-Recall Curve")
+cat("PR AUC:", pr$auc.integral, "\n")
+
+# Metrics at multiple thresholds
+thresholds <- seq(0, 1, 0.05)
+f1_scores <- sapply(thresholds, function(t) {
+  estimate <- factor(preds_clf > t, levels = c(FALSE, TRUE))
+  yardstick::f_meas_vec(factor(test$exceed, levels = c(FALSE, TRUE)), estimate)
+})
+best_thresh <- thresholds[which.max(f1_scores)]
+cat("Best F1-score threshold:", best_thresh, "\n")
+plot(thresholds, f1_scores, type = "b", main = "F1-score vs. threshold", xlab = "Threshold", ylab = "F1-score")
+abline(v = best_thresh, col = "red", lty = 2)
+
+# Show full metrics at best threshold
+best_pred <- factor(preds_clf > best_thresh, levels = c(FALSE, TRUE))
+eval_tbl <- tibble(truth = factor(test$exceed, levels = c(FALSE, TRUE)),
+                   estimate = best_pred, .pred_TRUE = preds_clf)
+print(yardstick::metrics(eval_tbl, truth, estimate))
+
+# 7. SMOTE Balancing for Imbalanced Data -----------------------------
+# This section increases predictive power on rare exceedance events
+
+train_for_recipe <- train %>%
+  select(swim_site, lag1_precip, roll3_precip, roll7_precip, lag1_temp, lag1_cond,
+         dow, month, season, exceed) %>%
+  mutate(across(where(is.character), as.factor),
+         exceed = factor(exceed, levels = c(FALSE, TRUE)))
+
+rec <- recipe(exceed ~ ., data = train_for_recipe) %>%
+  step_novel(all_nominal_predictors()) %>%   # Handle new levels in test
+  step_dummy(all_nominal_predictors()) %>%
+  step_smote(exceed)
+
+train_smote <- prep(rec) %>% bake(new_data = NULL)
+cat("Rows after SMOTE:", nrow(train_smote), "\n")
+print(table(train_smote$exceed))
+
+set.seed(42)
+rf_smote <- ranger(
+  exceed ~ .,
+  data = train_smote,
+  importance = "permutation",
+  num.trees = 500,
+  probability = TRUE
+)
+
+test_for_recipe <- test %>%
+  select(swim_site, lag1_precip, roll3_precip, roll7_precip, lag1_temp, lag1_cond,
+         dow, month, season, exceed) %>%
+  mutate(across(where(is.character), as.factor),
+         exceed = factor(exceed, levels = c(FALSE, TRUE)))
+test_prepped <- bake(prep(rec), new_data = test_for_recipe)
+
+rf_preds_smote <- predict(rf_smote, data = test_prepped, type = "response")$predictions
+if (is.matrix(rf_preds_smote) && "TRUE" %in% colnames(rf_preds_smote)) {
+  preds_smote_clf <- rf_preds_smote[, "TRUE"]
+} else if (is.vector(rf_preds_smote)) {
+  preds_smote_clf <- as.numeric(rf_preds_smote)
+} else {
+  stop("Prediction output not recognized!")
+}
+
+# SMOTE Results and optimal threshold
+predicted_class_smote <- preds_smote_clf > 0.5
+accuracy_smote <- mean(predicted_class_smote == test_prepped$exceed)
+roc_smote <- roc(response = test_prepped$exceed, predictor = preds_smote_clf)
+cat("SMOTE RF Accuracy:", accuracy_smote, "SMOTE RF ROC AUC:", as.numeric(auc(roc_smote)), "\n")
+
+f1_smote <- sapply(thresholds, function(t) {
+  estimate <- factor(preds_smote_clf > t, levels = c(FALSE, TRUE))
+  f_meas_vec(test_prepped$exceed, estimate)
+})
+best_smote_thresh <- thresholds[which.max(f1_smote)]
+cat("SMOTE RF Best F1-score threshold:", best_smote_thresh, "\n")
+
+# Visualize SMOTE classification performance
+plot(thresholds, f1_smote, type = "b", main = "SMOTE RF F1-score vs. threshold", xlab = "Threshold", ylab = "F1-score")
+abline(v = best_smote_thresh, col = "red", lty = 2)
+
+# SMOTE PR AUC
+pr_smote <- PRROC::pr.curve(scores.class0 = preds_smote_clf[test_prepped$exceed == TRUE],
+                            scores.class1 = preds_smote_clf[test_prepped$exceed == FALSE],
+                            curve = TRUE)
+cat("SMOTE RF PR AUC:", pr_smote$auc.integral, "\n")
+plot(pr_smote, main = "SMOTE RF Precision-Recall Curve")
+
+# Map top exceedance risk locations
+top_exceed_smote <- tibble(
+  swim_site = test_for_recipe$swim_site,
+  date = test$date,
+  observed = test_prepped$exceed,
+  rf_smote_prob = preds_smote_clf
+) %>%
+  arrange(desc(rf_smote_prob)) %>%
+  head(10)
+print(top_exceed_smote)
+
+top_alerts <- top_exceed_smote %>%
+  left_join(df %>% select(swim_site, latitude, longitude) %>% distinct(), by="swim_site")
+leaflet(top_alerts) %>%
+  addTiles() %>%
+  addCircleMarkers(lng = ~longitude, lat = ~latitude, label = ~paste(swim_site, date, rf_smote_prob),
+                   radius = 6, color = "red")
+
+hist(preds_smote_clf, breaks = 40, main = "RF Predicted Probabilities (SMOTE)", xlab = "Predicted exceedance probability")
+abline(v = 0.65, col = "red", lty = 2)
+
+# ===================================================================
+# Results Summary Table ---------------------------------------------
+# ===================================================================
+results_summary <- tibble(
+  Model = c("RF Regression", "RF Classification", "RF Classification + SMOTE"),
+  RMSE = c(round(rmse_val,2), NA, NA),
+  R2 = c(round(rsq_val,3), NA, NA),
+  Accuracy = c(NA, round(accuracy,3), round(accuracy_smote,3)),
+  ROC_AUC = c(NA, round(auc_val,3), round(as.numeric(auc(roc_smote)),3)),
+  PR_AUC = c(NA, round(pr$auc.integral,3), round(pr_smote$auc.integral,3)),
+  F1_Optimal_Threshold = c(NA, round(best_thresh,2), round(best_smote_thresh,2))
+)
+print(results_summary)
+
